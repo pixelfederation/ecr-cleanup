@@ -8,21 +8,23 @@ import boto3
 import botocore.exceptions
 import datetime
 
-version = '0.1.0'
+version = '0.2.0'
 BUCKET_NAME = 'ecr-cleanup'
 CONFIG_NAME_S3 = 'cluster_list'
 CLUSTER_NAME = None
 AWS_REGION = None
 IMAGES_TO_KEEP = 20
-DRYRUN = False
+DRY_RUN = False
+EXCLUDE_REPOS = '""'  # format for printing default value
 # IGNORE_TAGS_REGEX = '^$'
 
 running_containers = []
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Deletes old images from ECR')
-
     subparsers = parser.add_subparsers(metavar='', dest='command')
+
     parser_gen = subparsers.add_parser('genImagesList', help='Generate list of running/live images from current k8s cluster and store it on s3')
     parser_clean = subparsers.add_parser('cleanImages', help='Clean ECR images')
 
@@ -31,7 +33,8 @@ def parse_args():
     parser_clean.add_argument('-t', action='store_true', default='False', help='Prints the images for deletion without deleting them', dest='dry_run')
     parser_clean.add_argument('-r', action='store', help='ECR region (default: {})'.format(AWS_REGION), dest='aws_region', metavar='')
     parser_clean.add_argument('-k', action='store', help='Number of images to keep (default: {})'.format(IMAGES_TO_KEEP), dest='images_to_keep', metavar='')
-    
+    parser_clean.add_argument('-e', action='store', help='Exlude repositories, comma separated strings (default: {})'.format(EXCLUDE_REPOS), dest='exclude_repos', metavar='')
+
     parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + version)
 
     args = parser.parse_args()
@@ -40,11 +43,14 @@ def parse_args():
 
     return args
 
+
+# set variables in order: command line, env variables, set/keep default value
 def set_vars(args):
     global CLUSTER_NAME
     global AWS_REGION
     global IMAGES_TO_KEEP
-    global DRYRUN
+    global DRY_RUN
+    global EXCLUDE_REPOS
     # global IGNORE_TAGS_REGEX
 
     if args.command == 'cleanImages':
@@ -57,20 +63,29 @@ def set_vars(args):
             IMAGES_TO_KEEP = int(args.images_to_keep)
         elif 'IMAGES_TO_KEEP' in os.environ:
             IMAGES_TO_KEEP = int(os.environ['IMAGES_TO_KEEP'])
-        
-        if args.dry_run == True:
-            DRYRUN = args.dry_run
-        elif 'DRYRUN' in os.environ:
-            if os.environ['DRYRUN'].lower() == 'true':
-                DRYRUN = True
+
+        if args.dry_run:
+            DRY_RUN = args.dry_run
+        elif 'DRY_RUN' in os.environ:
+            if os.environ['DRY_RUN'].lower() == 'true':
+                DRY_RUN = True
             else:
-                DRYRUN = False
+                DRY_RUN = False
+
+        if args.exclude_repos:
+            EXCLUDE_REPOS = [item.strip() for item in args.exclude_repos.split(',')]
+        elif 'EXCLUDE_REPOS' in os.environ:
+            EXCLUDE_REPOS = [item.strip() for item in os.environ['EXCLUDE_REPOS'].split(',')]
+        else:
+            EXCLUDE_REPOS = []
+
     elif args.command == 'genImagesList':
         if args.cluster_name:
             CLUSTER_NAME = args.cluster_name
         elif 'CLUSTER_NAME' in os.environ:
             CLUSTER_NAME = os.environ['CLUSTER_NAME']
-        
+
+
 def add_live_container(image_name):
     global running_containers
 
@@ -88,15 +103,15 @@ def generate_live_images_list():
         except:
             print("WARNING: Not in k8s cluster.")
             in_cluster = False
-        
+
         if not in_cluster:
             try:
                 config.load_kube_config()
             except:
                 sys.exit("ERROR: Unable to load k8s config.")
-        
+
         v1 = client.CoreV1Api()
-        
+
         pods_list = v1.list_pod_for_all_namespaces(watch=False)
         for pod in pods_list.items:
             for container in pod.spec.containers:
@@ -115,8 +130,10 @@ def generate_live_images_list():
     else:
         sys.exit("ERROR: Missing cluster name")
 
+
 def get_keep_tags():
     return ['latest']
+
 
 def clean_ecr_repo():
     global running_containers
@@ -131,7 +148,7 @@ def clean_ecr_repo():
 
             # list of ECR repositories
             repositories = []
-            
+
             # ECR repositories without live images
             repositories_wo_live_images = []
 
@@ -140,7 +157,7 @@ def clean_ecr_repo():
             for repo_list_paginator in repo_desc_paginator.paginate():
                 for repo in repo_list_paginator['repositories']:
                     repositories.append(repo)
-            
+
             # get tags to keep
             keep_tags = get_keep_tags()
 
@@ -153,12 +170,16 @@ def clean_ecr_repo():
                 images_tagged_rest = []
                 delete_sha = []
                 delete_tag = []
-                
+                skip_repo = False
+
+                if isExcluded(repo['repositoryUri'], EXCLUDE_REPOS):
+                    skip_repo = True
+
                 # get list of images in ECR repository
                 image_desc_paginator = ecr_client.get_paginator('describe_images')
                 for image_list_paginator in image_desc_paginator.paginate(registryId=repo['registryId'], repositoryName=repo['repositoryName']):
                     for image in image_list_paginator['imageDetails']:
-                        
+
                         # if image has no tags, mark it for deletion
                         # if image has some tags, check if it's live or if we want to keep the tag
                         if 'imageTags' in image:
@@ -176,54 +197,67 @@ def clean_ecr_repo():
                                         append_to_list(images_tagged_rest, image)
                         else:
                             append_to_list(delete_sha, image['imageDigest'])
-                    
+
                 print("Total number of images found:", len(images_tagged_rest) + len(delete_sha) + len(images_keep_sha) + len(images_live_sha))
                 print("Number of tagged images found:", len(images_tagged_rest))
                 print("Number of untagged images found:", len(delete_sha))
                 print("Number of live images found:", len(images_live_sha))
                 print("Number of images to keep by tag:", len(images_keep_sha))
-                
+
                 # sort images list by push date in reverse order
                 images_tagged_rest.sort(key=lambda k: k['imagePushedAt'], reverse=True)
-                
+
                 # remember ECR repositories without live images for future cleaning
                 if len(images_live_sha) <= 0:
                     repositories_wo_live_images.append(repo['repositoryUri'])
 
                 images_to_delete = 0
                 # prepare images for deletion
-                for image in images_tagged_rest:
-                    image_time = image["imagePushedAt"].replace(tzinfo=None)
-                    if images_tagged_rest.index(image) >= IMAGES_TO_KEEP and image_time < cleanup_timestamp:
-                        images_to_delete += 1
-                        append_to_list(delete_sha, image['imageDigest'])
-                        for tag in image['imageTags']:
-                            append_to_list(delete_tag, {"imageUrl": repo['repositoryUri'] + ":" + tag, "pushedAt": image["imagePushedAt"]})
-                    
-                print("Number of tagged images before '{}' marked for deletion: {}".format(cleanup_timestamp, images_to_delete))
+                if skip_repo:
+                    print("\nDirectory is excluded from cleanup. Only untagged images will be deleted\n")
+                else:
+                    for image in images_tagged_rest:
+                        image_time = image["imagePushedAt"].replace(tzinfo=None)
+                        if images_tagged_rest.index(image) >= IMAGES_TO_KEEP and image_time < cleanup_timestamp:
+                            images_to_delete += 1
+                            append_to_list(delete_sha, image['imageDigest'])
+                            for tag in image['imageTags']:
+                                append_to_list(delete_tag, {"imageUrl": repo['repositoryUri'] + ":" + tag,
+                                                            "pushedAt": image["imagePushedAt"]})
+
+                    print("Number of tagged images before '{}' marked for deletion: {}".format(cleanup_timestamp, images_to_delete))
 
                 # delete images
                 if delete_sha:
                     print("\nNumber of images to be deleted: {}".format(len(delete_sha)))
-                    
+
                     delete_images(ecr_client, delete_sha, delete_tag, repo['registryId'], repo['repositoryName'])
                 else:
                     print("Nothing to delete in the repository : " + repo['repositoryName'])
-            
+
             print("\nRepositories without live images:")
             for repo_not_used in repositories_wo_live_images:
                 print(repo_not_used)
-            
+
         except Exception as e:
-        # except botocore.exceptions.EndpointConnectionError as e:
+            # except botocore.exceptions.EndpointConnectionError as e:
             print(e)
     else:
         sys.exit('ERROR: Region not set.')
+
+
+def isExcluded(name, list):
+    for item in list:
+        if name.endswith(item):
+            return True
+    return False
+
 
 def get_chunks(l, n):
     """Yield successive n-sized chunks from l."""
     for i in range(0, len(l), n):
         yield l[i:i + n]
+
 
 def make_dictionary(list, key):
     result = []
@@ -231,6 +265,7 @@ def make_dictionary(list, key):
         append_to_list(result, {key: item})
 
     return result
+
 
 def delete_images(ecr_client, delete_sha, delete_tag, id, name):
     if delete_sha:
@@ -240,7 +275,7 @@ def delete_images(ecr_client, delete_sha, delete_tag, id, name):
         delete_sha = make_dictionary(delete_sha, 'imageDigest')
         for delete_sha_chunk in get_chunks(delete_sha, 100):
             i += 1
-            if not DRYRUN:
+            if not DRY_RUN:
                 print('\tBatch delete AWS', i)
                 delete_response = ecr_client.batch_delete_image(registryId=id, repositoryName=name, imageIds=delete_sha_chunk)
                 print("AWS response", delete_response)
@@ -254,13 +289,16 @@ def delete_images(ecr_client, delete_sha, delete_tag, id, name):
         for item in delete_tag:
             print(" - {} - {}".format(item['imageUrl'], item['pushedAt']))
 
+
 def append_to_list(list, item):
     if item not in list:
         list.append(item)
 
+
 def remove_from_list(list, item):
-    if item  in list:
+    if item in list:
         list.remove(item)
+
 
 def save_list_s3():
     if CLUSTER_NAME:
@@ -272,6 +310,7 @@ def save_list_s3():
         config_update_s3(CLUSTER_NAME)
     else:
         sys.exit("ERROR: Missing cluster name")
+
 
 def config_update_s3(cluster_name):
     s3_resource = boto3.resource('s3')
@@ -287,7 +326,7 @@ def config_update_s3(cluster_name):
         if e.response['Error']['Code'] == "404":
             config_exists = False
             print("WARNING: Config file does not exist.")
-    
+
     # load config if exists
     if config_exists:
         print("Loading config from S3")
@@ -304,6 +343,7 @@ def config_update_s3(cluster_name):
         cluster_list.append(CLUSTER_NAME)
         s3_obj.put(Body=json.dumps(cluster_list))
         print("Config updated with '{}' cluster.".format(CLUSTER_NAME))
+
 
 def load_list_s3():
     global running_containers
@@ -329,7 +369,7 @@ def load_list_s3():
     data = s3_obj.get()['Body'].read()
     cluster_list = json.loads(data)
     print("Current clusters list:", cluster_list)
-    
+
     for cluster in cluster_list:
         print("Reading live images list from s3 for cluster '{}'".format(cluster))
         s3_list = s3_resource.Object(BUCKET_NAME, cluster)
@@ -342,7 +382,7 @@ def load_list_s3():
                 sys.exit("ERROR: Unable to load images list file '{}'.".format(cluster))
         except:
             sys.exit("ERROR: Unable to load images list file '{}'.".format(cluster))
-        
+
         list_time = s3_list.last_modified.replace(tzinfo=None)
         print("List timestamp", list_time, end='')
 
@@ -356,13 +396,14 @@ def load_list_s3():
         image_list = json.loads(data)
         print('Live images found so far:', len(running_containers))
         print('Loading images:', len(image_list))
-        
+
         for image in image_list:
             append_to_list(running_containers, image)
-        
+
         print('Live images after load and deduplication:', len(running_containers))
 
     return oldest_list_time
+
 
 if __name__ == "__main__":
     args = parse_args()
