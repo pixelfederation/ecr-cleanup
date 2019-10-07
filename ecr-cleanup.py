@@ -30,7 +30,7 @@ def parse_args():
 
     parser_gen.add_argument('-n', action='store', help="K8s cluster name", dest='cluster_name', metavar='')
 
-    parser_clean.add_argument('-t', action='store_true', default='False', help='Prints the images for deletion without deleting them', dest='dry_run')
+    parser_clean.add_argument('-t', action='store_true', help='Prints the images for deletion without deleting them', dest='dry_run')
     parser_clean.add_argument('-r', action='store', help='ECR region (default: {})'.format(AWS_REGION), dest='aws_region', metavar='')
     parser_clean.add_argument('-k', action='store', help='Number of images to keep (default: {})'.format(IMAGES_TO_KEEP), dest='images_to_keep', metavar='')
     parser_clean.add_argument('-e', action='store', help='Exlude repositories, comma separated strings (default: {})'.format(EXCLUDE_REPOS), dest='exclude_repos', metavar='')
